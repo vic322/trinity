@@ -153,6 +153,13 @@ namespace trinity::game
         enum class AddState { Idle, Pending, Added, Failed };
         static AddState AddStatus();
 
+        // True when every engine entry point resolved but the authoritative
+        // holder has not been seen yet. The holder is learned by watching the
+        // game's own inventory transactions, so until one happens - a pickup, a
+        // purchase, a loot - adds are refused. This distinguishes "not yet"
+        // from a real failure so the menu can say which.
+        static bool AwaitingAuthority();
+
         // Bulk add: queue `count` items (from `typeIds`), `qtyEach` of each, in
         // one action - "add X of every item in this category". Same engine path
         // as AddItem, just many of them, drained a few per Tick so the adds never

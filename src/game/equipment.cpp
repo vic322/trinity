@@ -1836,6 +1836,11 @@ namespace trinity::game
             char itemName[96] = "";
             Inventory::NameForTypeId(tid, itemName, sizeof(itemName));
             if (IsDummyOrUnarmed(tid, itemName)) return;
+            // Infinite Durability calls this on a timer, so a piece already at
+            // full is the common case: writing it anyway costs a realm-flag
+            // round trip per item and reports a repair that did not happen.
+            uint16_t durability = 0;
+            if (Read16(entry + kOff_ItemVal_Durability, &durability) && durability >= 10000) return;
             Write16(entry + kOff_ItemVal_Durability, 10000);
             ++repaired;
         };

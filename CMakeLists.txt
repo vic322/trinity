@@ -76,7 +76,6 @@ add_library(Trinity SHARED
     src/core/version_detect.cpp
     src/mem/scanner.cpp
     src/game/player.cpp
-    src/game/focused_tick.cpp
     src/game/teleport.cpp
     src/game/inventory.cpp
     src/game/inventory_logic.cpp

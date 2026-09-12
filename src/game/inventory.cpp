@@ -5021,6 +5021,14 @@ namespace trinity::game
         return static_cast<AddState>(g_addState.load(std::memory_order_acquire));
     }
 
+    bool Inventory::AwaitingAuthority()
+    {
+        const bool ready = oItemValueCtor && oHolderInsert &&
+                           (oCommitPlacement || oCommitPlacement201) &&
+                           oFreePlacements && oNtQueryInfoThread;
+        return ready && CurrentHolder() != 0 && ServerHolder() == 0;
+    }
+
     bool Inventory::AddItemsBulk(const uint16_t* typeIds, int count, int64_t qtyEach)
     {
         if (!typeIds || count <= 0 || qtyEach < 1) return false;
