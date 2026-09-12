@@ -173,8 +173,7 @@ namespace trinity::game
         // Match authoritative stamina gauges in Crimson Desert (Sprint 20, Pool 22, Mount Gallop/Flight 19).
         // Strictly purged 17 & 18 (internal Heat/Combustion gauges) and 48 (Fire Breath) to completely prevent character auto-ignition.
         bool IsStaminaType(int32_t t) {
-            return t == StatType_SprintSt || t == StatType_StaminaPool117 ||
-                   t == StatType_MountSprint || t == 19 || t == 20 || t == 22;
+            return t == 22; // PE2850 verified stamina; exclude environmental meters.
         }
 
         // Both spirit-typed HUD gauges: 21 (SpiritPool) and 23 (SpiritPool117)
@@ -359,7 +358,7 @@ namespace trinity::game
                 g_playerPossessor.store(static_cast<uintptr_t>(possessor), std::memory_order_release);
 
             int nStam = 0, nSpir = 0;
-            for (int k = 1; k < kStatArray_ScanEntries; ++k)
+            for (int k = 1; k < 20; ++k)
             {
                 const uintptr_t e = c.statArray + k * kSizeof_StatEntry;
                 int32_t statType = 0;
@@ -382,21 +381,17 @@ namespace trinity::game
 
         void TickResolveSelf()
         {
-            if (!g_charMgrGlobal)
-            {
-                TickResolveCurrentPlayerFallback();
+            uint64_t p = 0, mgr = 0, data = 0;
+            uint32_t count = 0;
+            if (!g_charMgrGlobal || !Read64(g_charMgrGlobal,&p) || p < kMinPointer ||
+                !Read64(static_cast<uintptr_t>(p),&mgr) || mgr < kMinPointer ||
+                !Read64(static_cast<uintptr_t>(mgr)+kOff_CharMgr_ListData,&data) || data < kMinPointer ||
+                !Read32(static_cast<uintptr_t>(mgr)+kOff_CharMgr_ListCount,&count) ||
+                count == 0 || count > kCharList_MaxCount) {
+                ClearPlayerSets();
+                g_playerPossessor.store(0,std::memory_order_release);
                 return;
             }
-            uint64_t p = 0, mgr = 0, data = 0;
-            if (!Read64(g_charMgrGlobal, &p) || p < kMinPointer) return;                 // P = *slot
-            if (!Read64(static_cast<uintptr_t>(p), &mgr) || mgr < kMinPointer) return;   // mgr = *P
-            if (!Read64(static_cast<uintptr_t>(mgr) + kOff_CharMgr_ListData, &data) ||
-                data < kMinPointer)
-                return;
-            uint32_t count = 0;
-            if (!Read32(static_cast<uintptr_t>(mgr) + kOff_CharMgr_ListCount, &count) ||
-                count == 0 || count > kCharList_MaxCount)
-                return;
 
             // (A) The protagonist class vtable = the vtable of any player-class
             // character (the SelfPlayer/OtherPlayer pool all share it).
@@ -449,7 +444,7 @@ namespace trinity::game
                 ++nPlayers;
 
                 // Scan stat array for stamina (17, 19, 20, 22) and spirit (18, 21, 23)
-                for (int k = 1; k < kStatArray_ScanEntries; ++k)
+                for (int k = 1; k < 20; ++k)
                 {
                     const uintptr_t e = c.statArray + k * kSizeof_StatEntry;
                     int32_t stt = 0;
@@ -499,7 +494,7 @@ namespace trinity::game
                             g_mountOwners[nMounts].store(owner, std::memory_order_release);
                             ++nMounts;
                         }
-                        for (int k = 0; k < kStatArray_ScanEntries; ++k)
+                        for (int k = 0; k < 20; ++k)
                         {
                             const uintptr_t e = mountStatArray + k * kSizeof_StatEntry;
                             int32_t stt = 0;
@@ -586,7 +581,6 @@ namespace trinity::game
                                     ((st.infStamina && isStam) || (st.infMountStamina && isMountStam)) ||
                                     (st.infSpirit && isSpirit);
 
-            int64_t fullTarget = target;
             if (shouldLock)
             {
                 uint64_t base = 0, cap = 0, cur = 0;
@@ -597,8 +591,8 @@ namespace trinity::game
                 if (!full && cur > 0 && cur < 1000000000ULL) full = cur;
                 if (full > 0)
                 {
+                    PinEntry(e);
                     target = static_cast<int64_t>(full);
-                    fullTarget = target;
                 }
             }
 
@@ -607,7 +601,7 @@ namespace trinity::game
             if (shouldLock)
                 PinEntry(e);
 
-            return shouldLock ? fullTarget : result;
+            return result; // PE2850 returns flags, not the requested stat value.
         }
 
         bool IsPlayerEntity(uintptr_t target)
@@ -809,18 +803,20 @@ namespace trinity::game
     bool Player::Install()
     {
         g_charMgrGlobal = ResolveCharMgrGlobal();
-        if (!g_charMgrGlobal)
-        {
-            LOG_ERR("player: char-manager global NOT FOUND (no anchor matched) - God Mode / "
-                    "Infinite Stamina / Infinite Spirit limited to the current-character fallback.");
+        if (!g_charMgrGlobal) {
+            LOG_ERR("Combat menu: player manager unavailable; no gameplay hooks installed.");
+            return false;
         }
-
         // TU 2.01 removed the old single stat-commit funnel.  The resolved
         // character manager plus the per-frame entry pins are the current
         // guard on this build; do not search/hook a stale ABI.
         if (core::UsesTu201CompatibleRevision(core::GetGameVersion().revision))
         {
-            LOG_OK("player: modern continuous stat-pin guard active (all resolved characters).");
+            constexpr const char* modernCommit =
+                "66 44 89 4C 24 20 48 89 54 24 10 53 55 56 57 41 56 48 83 EC 40 4C 8D 71 18 48 89 CF 48 8B 49 20 4C 89 C3 49 03 0E";
+            mem::InstallHook("player: PE2850 stat guard", modernCommit,
+                             "synchronous health/stamina protection unavailable",
+                             &hkStatCommit, &oStatCommit, &g_commitTarget);
         }
         else
         {
@@ -848,14 +844,11 @@ namespace trinity::game
             LOG_OK("player: damage-apply hook installed @ %p", g_damageHookTarget);
         }
 
-        // Native Combat Timing Evaluator: Perfect Parry & Perfect Dodge (sub_1407219c0)
-        if (mem::InstallHook("player: combat-timing", kSig_CombatTimingEval,
-                             "Easy Parry & Easy Evade helper timing disabled",
-                             &hkCombatTimingEval, &oCombatTimingEval, &g_combatTimingTarget))
-        {
-            LOG_OK("player: combat-timing hook installed @ %p", g_combatTimingTarget);
+        if (!g_damageHookTarget || !g_commitTarget) {
+            mem::RemoveHook(&g_damageHookTarget);
+            mem::RemoveHook(&g_commitTarget);
+            return false;
         }
-
         return true;
     }
 
@@ -867,7 +860,11 @@ namespace trinity::game
         const uint64_t requestedUntil =
             g_characterTrackingRequestedUntilMs.load(std::memory_order_acquire);
         if (!ShouldRefreshTrackedCharacters(statFeatureActive, now, requestedUntil))
+        {
+            ClearPlayerSets();
+            g_playerPossessor.store(0,std::memory_order_release);
             return;
+        }
 
         TickResolveSelf();
         if (st.infStamina || st.infMountStamina)

@@ -28,10 +28,10 @@ namespace trinity
         // Menu open/close binding (framework.cpp PollMenuToggle /
         // PollToggleCombo), rebindable from the SYSTEM tab's Keybinds submenu
         // and persisted in Trinity.ini. openKeyVk is a Win32 virtual-key code
-        // (default VK_INSERT); openPadMask is an XInput button mask that must
+        // (default VK_OEM_3, tilde/backtick); openPadMask is an XInput button mask that must
         // be held in full - a single button or a combo (default LB + D-Pad
         // Down).
-        int          openKeyVk  = 0x2D;          // VK_INSERT
+        int          openKeyVk  = 0xC0;          // VK_OEM_3: tilde/backtick, no Shift required
         unsigned int openPadMask = 0x0100 | 0x0002; // LB | DPAD_DOWN
 
         // Transient: a Keybinds-submenu row is listening for the next key /
@@ -45,7 +45,7 @@ namespace trinity
         bool godMode         = false;
         bool oneHitKill      = false;
         bool infDurability   = false;
-        bool noFallDamage    = true;
+        bool noFallDamage    = false;
         bool infStamina      = false;
         bool infMountStamina = false;
         bool infSpirit       = false;

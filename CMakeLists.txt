@@ -42,9 +42,19 @@ target_include_directories(imgui PUBLIC
 FetchContent_Declare(
     minhook
     GIT_REPOSITORY https://github.com/TsudaKageyu/minhook.git
-    GIT_TAG        master
+    GIT_TAG        8af6b4acae5a9388fd742b56fa79ece89d96f823
 )
 FetchContent_MakeAvailable(minhook)
+
+# Crimson Desert's low address space is crowded after a save loads. Keep
+# trampolines within signed rel32 reach, using the full range minus 64 KiB.
+file(READ "${minhook_SOURCE_DIR}/src/buffer.c" COMBAT_MINHOOK_BUFFER)
+string(REPLACE "#define MAX_MEMORY_RANGE 0x40000000"
+               "#define MAX_MEMORY_RANGE 0x7FFF0000"
+               COMBAT_MINHOOK_PATCHED "${COMBAT_MINHOOK_BUFFER}")
+if(NOT COMBAT_MINHOOK_BUFFER STREQUAL COMBAT_MINHOOK_PATCHED)
+    file(WRITE "${minhook_SOURCE_DIR}/src/buffer.c" "${COMBAT_MINHOOK_PATCHED}")
+endif()
 
 option(ENABLE_EXTENDED_HOOKS "Enable extended engine hooks" OFF)
 
@@ -66,6 +76,7 @@ add_library(Trinity SHARED
     src/core/version_detect.cpp
     src/mem/scanner.cpp
     src/game/player.cpp
+    src/game/focused_tick.cpp
     src/game/teleport.cpp
     src/game/inventory.cpp
     src/game/inventory_logic.cpp

@@ -38,7 +38,10 @@ namespace trinity::mem
 
         const size_t matches = CountMatches(sig, maxMatches);
         if (matches != 1)
-            LOG_WARN("%s signature ambiguous (%zu); hooking first.", context, matches);
+        {
+            LOG_ERR("%s signature ambiguous (%zu); hook disabled.", context, matches);
+            return false;
+        }
 
         void* t = reinterpret_cast<void*>(addr);
         const MH_STATUS createStatus = MH_CreateHook(
@@ -54,6 +57,7 @@ namespace trinity::mem
         const MH_STATUS enableStatus = MH_EnableHook(t);
         if (enableStatus != MH_OK)
         {
+            MH_RemoveHook(t);
             LOG_ERR("%s: MH_EnableHook failed (%s) - %s.",
                     context, MH_StatusToString(enableStatus), consequence ? consequence : "");
             *original = nullptr;
