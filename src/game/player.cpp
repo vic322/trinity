@@ -102,6 +102,180 @@ namespace trinity::game
             return vals[best];
         }
 
+        // --- Structural fallback for the char-manager global -----------------
+        //
+        // Byte anchors key on the instructions *around* the global, so a Title
+        // Update that recompiles those call sites takes them with it. Install()
+        // gives up entirely when that happens, which turns one stale pattern
+        // into "no gameplay hooks at all" - and on this build only one of the
+        // five anchors still matches, so there is not much margin left.
+        //
+        // The manager's shape outlives the code that reaches it:
+        //
+        //     global -> P -> mgr,  mgr+ListData = character*[],  mgr+ListCount
+        //
+        // so walk the module's committed pages, treat every aligned qword as a
+        // candidate global, and keep whichever one's double dereference lands on
+        // that shape. Reads are SEH-guarded, so following a garbage chain costs
+        // a failed read rather than the process.
+
+        // Is `ch` the body actually being driven right now? The controller points
+        // back at exactly the pawn it possesses, so this round-trip closes for the
+        // live body and for nothing else.
+        bool PossessorRoundTrips(uintptr_t ch)
+        {
+            uintptr_t poss = 0, pawn = 0;
+            if (!ReadPtr(ch + kOff_Owner_Possessor, &poss) || poss < kMinPointer) return false;
+            if (!ReadPtr(poss + kOff_Possessor_Pawn, &pawn)) return false;
+            return pawn == ch;
+        }
+
+        // Does `mgr` look like the character manager, and does its list hold the
+        // player? Returns a score, or -1 when the object has the wrong shape.
+        int ScoreCharManager(uintptr_t mgr, int* outTagged, int* outDriven, uint32_t* outCount)
+        {
+            uintptr_t data  = 0;
+            uint32_t  count = 0;
+            if (!ReadPtr(mgr + kOff_CharMgr_ListData, &data) || data < kMinPointer) return -1;
+            if (!Read32(mgr + kOff_CharMgr_ListCount, &count))                      return -1;
+            if (count < 16 || count > kCharList_MaxCount)                            return -1;
+
+            const mem::ModuleRegion& mod = mem::GameModule();
+            const uintptr_t modBase = mod.base, modEnd = mod.base + mod.size;
+
+            const uint32_t limit = (count < 2048u) ? count : 2048u;
+            int valid = 0, tagged = 0, driven = 0;
+            for (uint32_t i = 0; i < limit; ++i)
+            {
+                uintptr_t ch = 0;
+                if (!ReadPtr(data + 8ull * i, &ch)) return -1; // array not readable -> not it
+                if (ch < kMinPointer || (ch & 7) != 0) continue;
+
+                // A real engine object starts with a vtable pointer into the
+                // module. Without this, tables of item definitions sail through:
+                // their embedded text satisfies every other test, and the "type
+                // tag" is just a byte out of a string.
+                uintptr_t vt = 0;
+                if (!ReadPtr(ch, &vt)) continue;
+                if (vt < modBase || vt >= modEnd || (vt & 7) != 0) continue;
+                ++valid;
+
+                // Test the round-trip on EVERY entry, not only tag-matching ones:
+                // the controlled body is re-tagged while playing a secondary
+                // protagonist, so gating this behind the tag hides the one
+                // character that proves the list. Stop at the first hit - the
+                // check chases two usually-garbage pointers, and running it over
+                // every entry of every candidate costs tens of thousands of SEH
+                // faults per pass.
+                if (driven == 0 && PossessorRoundTrips(ch)) ++driven;
+
+                uintptr_t td  = 0;
+                uint8_t   tag = 0;
+                if (!ReadPtr(ch + kOff_Owner_TypeDesc, &td) || td < kMinPointer) continue;
+                if (!Read8(td + 1, &tag) || ((tag - 1) & 0xF7) != 0) continue;
+                ++tagged;
+            }
+            // The real list is densely populated with live objects; a struct that
+            // merely holds a pointer and a plausible integer is not.
+            if (valid < 16 || valid * 4 < static_cast<int>(limit)) return -1;
+
+            if (outTagged) *outTagged = tagged;
+            if (outDriven) *outDriven = driven;
+            if (outCount)  *outCount  = count;
+
+            // Holding the possessed body is the entry requirement; among lists
+            // that do, the widest one wins. Ranking by tagged count instead picks
+            // the engine's pool of player-class slots, which resolves the
+            // protagonists and then starves mount and vehicle discovery.
+            if (driven < 1) return 0;
+            return static_cast<int>(count);
+        }
+
+        uintptr_t ProbeCharMgrGlobal()
+        {
+            const mem::ModuleRegion& mod = mem::GameModule();
+            if (!mod) return 0;
+
+            const ULONGLONG t0 = GetTickCount64();
+            const uintptr_t imageEnd = mod.base + mod.size;
+
+            uintptr_t best = 0;
+            int bestScore = 0, candidates = 0, bestTagged = 0, bestDriven = 0;
+            uint32_t bestCount = 0;
+
+            MEMORY_BASIC_INFORMATION mbi{};
+            for (uintptr_t addr = mod.base; addr < imageEnd; )
+            {
+                if (!VirtualQuery(reinterpret_cast<void*>(addr), &mbi, sizeof(mbi))) break;
+                const uintptr_t regBase = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+                const uintptr_t regEnd  = regBase + mbi.RegionSize;
+
+                const bool readable =
+                    mbi.State == MEM_COMMIT &&
+                    (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE |
+                                    PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) != 0 &&
+                    (mbi.Protect & PAGE_GUARD) == 0;
+
+                if (readable)
+                {
+                    const uintptr_t stop = (regEnd < imageEnd) ? regEnd : imageEnd;
+                    for (uintptr_t g = (regBase + 7) & ~uintptr_t(7); g + 8 <= stop; g += 8)
+                    {
+                        uintptr_t p = 0, mgr = 0;
+                        if (!ReadPtr(g, &p) || p < kMinPointer || (p & 7) != 0)       continue;
+                        if (!ReadPtr(p, &mgr) || mgr < kMinPointer || (mgr & 7) != 0) continue;
+
+                        int tagged = 0, driven = 0;
+                        uint32_t count = 0;
+                        const int score = ScoreCharManager(mgr, &tagged, &driven, &count);
+                        if (score <= 0) continue;
+
+                        ++candidates;
+                        LOG("player:   probe candidate base+0x%llX -> count=%u tagged=%d driven=%d",
+                            static_cast<unsigned long long>(g - mod.base), count, tagged, driven);
+                        if (score > bestScore)
+                        {
+                            bestScore = score; best = g;
+                            bestTagged = tagged; bestDriven = driven; bestCount = count;
+                        }
+                    }
+                }
+                addr = (regEnd > addr) ? regEnd : addr + 0x1000;
+            }
+
+            const ULONGLONG ms = GetTickCount64() - t0;
+            if (bestDriven >= 1)
+            {
+                LOG("player: char-manager recovered structurally at base+0x%llX (count=%u, "
+                    "%d tagged, %d possessed, %d candidate(s), %llu ms). Byte anchors are stale "
+                    "for this build - re-derive kCharMgrAnchors from this address.",
+                    static_cast<unsigned long long>(best - mod.base), bestCount, bestTagged,
+                    bestDriven, candidates, ms);
+                return best;
+            }
+            LOG("player: probe pass saw %d candidate(s) but none with a possessed body (%llu ms).",
+                candidates, ms);
+            return 0;
+        }
+
+        // The probe has to run *after* the world exists: nothing is possessed on
+        // the title screen, and the manager is not populated enough to even be a
+        // candidate. A pass costs seconds, so it gets a thread of its own rather
+        // than the game thread, and stops for good once a pass succeeds.
+        DWORD WINAPI ProbeThread(LPVOID)
+        {
+            for (int pass = 1; pass <= 40; ++pass)
+            {
+                Sleep(5000);
+                if (g_charMgrGlobal) return 0;
+                const uintptr_t g = ProbeCharMgrGlobal();
+                if (g) { g_charMgrGlobal = g; return 0; }
+            }
+            LOG_ERR("player: structural probe gave up after 40 passes - stat features stay "
+                    "disabled.");
+            return 0;
+        }
+
         // The player set's stat entries + battle-damage identities, recomputed
         // each tick by RefreshSelf(). The stat hooks match against these live
         // sets instead of a historical cache: because they are always the
@@ -854,8 +1028,16 @@ namespace trinity::game
     {
         g_charMgrGlobal = ResolveCharMgrGlobal();
         if (!g_charMgrGlobal) {
-            LOG_ERR("Combat menu: player manager unavailable; no gameplay hooks installed.");
-            return false;
+            // Anchors are stale for this build. Installing nothing at all leaves
+            // no way back short of a new release, so start the structural probe
+            // and carry on: every hook below consults the tracked sets at
+            // runtime, and those stay empty - so the hooks pass through
+            // unchanged - until the probe fills the global in.
+            LOG_WARN("player: no char-manager anchor matched - starting the structural probe "
+                     "(retries every 5s until the world is loaded). Stat features stay inert "
+                     "until it succeeds.");
+            if (HANDLE h = CreateThread(nullptr, 0, ProbeThread, nullptr, 0, nullptr))
+                CloseHandle(h);
         }
         // TU 2.01 removed the old single stat-commit funnel.  The resolved
         // character manager plus the per-frame entry pins are the current
