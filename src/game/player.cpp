@@ -379,6 +379,31 @@ namespace trinity::game
                     PinEntry(g_spiritEntries[i].load(std::memory_order_relaxed));
         }
 
+        // Collect one body's stamina / spirit gauges. Index 0 is Health and is
+        // tracked separately, so the scan starts at 1 and stops at the first
+        // entry that does not read as a plausible stat - the array is not
+        // terminated, so the type check is what bounds it.
+        void ScanGauges(uintptr_t statArray, int& nStam, int& nSpir)
+        {
+            for (int k = 1; k < 20; ++k)
+            {
+                const uintptr_t e = statArray + k * kSizeof_StatEntry;
+                int32_t stt = 0;
+                if (!StatEntryType(e, &stt)) break;
+                if (!PlausibleStatType(stt)) break;
+                if (IsStaminaType(stt))
+                {
+                    if (nStam < kMaxStatEntries)
+                        g_stamEntries[nStam++].store(e, std::memory_order_release);
+                }
+                else if (IsSpiritType(stt))
+                {
+                    if (nSpir < kMaxStatEntries)
+                        g_spiritEntries[nSpir++].store(e, std::memory_order_release);
+                }
+            }
+        }
+
         void TickResolveSelf()
         {
             uint64_t p = 0, mgr = 0, data = 0;
@@ -418,12 +443,53 @@ namespace trinity::game
 
             int nPlayers = 0, nStam = 0, nMountStam = 0, nSpir = 0, nMounts = 0;
 
+            // (A2) Seed the set with the body actually being driven.
+            //
+            // The vtable gate in (B) anchors on the first player-class character
+            // in the list, which is Kliff whenever he is present - he keeps the
+            // SelfPlayer tag even while a secondary protagonist is the one under
+            // your control. A protagonist whose class vtable differs from his is
+            // then driven but never enumerated, and every consumer of these sets
+            // - God Mode, the damage multipliers, the stat pins - goes quietly
+            // inert for that character while transform-only features keep working.
+            //
+            // The possessor's active pawn is authoritative about who is being
+            // driven, so take it first and let (B) fill the remaining slots. It
+            // has to be seeded rather than appended because the loop stops at
+            // kMaxPartyPlayers: appending would let two companions fill the set
+            // and leave out the character you are actually playing.
+            //
+            // Riding needs no special case - while mounted the active pawn is the
+            // mount, and WalkSelfChain's "index 0 must be a Health entry" check
+            // rejects it, which is why mounts have their own vital walker.
+            uintptr_t drivenOwner = 0;
+            if (playerPoss >= kMinPointer)
+            {
+                uint64_t pawn = 0;
+                if (Read64(static_cast<uintptr_t>(playerPoss) + kOff_Possessor_Pawn, &pawn) &&
+                    pawn >= kMinPointer)
+                {
+                    SelfChain dc;
+                    if (WalkSelfChain(static_cast<uintptr_t>(pawn), &dc))
+                    {
+                        drivenOwner = static_cast<uintptr_t>(pawn);
+                        g_hpEntries[0].store(dc.statArray, std::memory_order_release);
+                        g_actors[0].store(dc.actor, std::memory_order_release);
+                        g_targetOwners[0].store(dc.targetOwner, std::memory_order_release);
+                        g_owners[0].store(drivenOwner, std::memory_order_release);
+                        nPlayers = 1;
+                        ScanGauges(dc.statArray, nStam, nSpir);
+                    }
+                }
+            }
+
             // (B) Track active protagonist bodies with matching vtable
             for (uint32_t i = 0; i < count && nPlayers < kMaxPartyPlayers; ++i)
             {
                 uint64_t ch = 0;
                 if (!Read64(static_cast<uintptr_t>(data) + 8ull * i, &ch) || ch < kMinPointer) continue;
                 const uintptr_t owner = static_cast<uintptr_t>(ch);
+                if (owner == drivenOwner) continue; // already seeded above
                 uint64_t vt = 0;
                 if (!Read64(owner, &vt) || vt != anchorVt) continue;
 
@@ -444,23 +510,7 @@ namespace trinity::game
                 ++nPlayers;
 
                 // Scan stat array for stamina (17, 19, 20, 22) and spirit (18, 21, 23)
-                for (int k = 1; k < 20; ++k)
-                {
-                    const uintptr_t e = c.statArray + k * kSizeof_StatEntry;
-                    int32_t stt = 0;
-                    if (!StatEntryType(e, &stt)) break;
-                    if (!PlausibleStatType(stt)) break;
-                    if (IsStaminaType(stt))
-                    {
-                        if (nStam < kMaxStatEntries)
-                            g_stamEntries[nStam++].store(e, std::memory_order_release);
-                    }
-                    else if (IsSpiritType(stt))
-                    {
-                        if (nSpir < kMaxStatEntries)
-                            g_spiritEntries[nSpir++].store(e, std::memory_order_release);
-                    }
-                }
+                ScanGauges(c.statArray, nStam, nSpir);
             }
 
             // Mount stamina discovery. TU 2.01 folds state bits into owner+0x48
